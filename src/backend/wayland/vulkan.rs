@@ -3,25 +3,25 @@ use std::{collections::HashMap, ffi::CStr};
 
 pub struct Vulkan {
     instance: ash::Instance,
+    _entry: ash::Entry,
     // TODO purge cache at some point
     device_name_cache: HashMap<u64, VkResult<Option<String>>>,
 }
 
 impl Vulkan {
-    pub fn new() -> Option<Self> {
-        let entry = unsafe { ash::Entry::load().ok()? };
+    pub fn new() -> anyhow::Result<Self> {
+        let entry = unsafe { ash::Entry::load()? };
         let app_info = vk::ApplicationInfo {
             api_version: vk::make_api_version(0, 1, 1, 0),
             ..Default::default()
         };
-        let extensions = &[c"VK_EXT_physical_device_drm".as_ptr()];
         let create_info = vk::InstanceCreateInfo {
             p_application_info: &app_info,
             ..Default::default()
-        }
-        .enabled_extension_names(extensions);
-        let instance = unsafe { entry.create_instance(&create_info, None).ok()? };
-        Some(Self {
+        };
+        let instance = unsafe { entry.create_instance(&create_info, None)? };
+        Ok(Self {
+            _entry: entry,
             instance,
             device_name_cache: HashMap::new(),
         })
@@ -30,6 +30,9 @@ impl Vulkan {
     pub fn device_name(&mut self, dev: u64) -> VkResult<Option<&str>> {
         if !self.device_name_cache.contains_key(&dev) {
             let value = self.device_name_uncached(dev);
+            if let Err(err) = &value {
+                log::error!("Failed to query Vulkan device properties: {}", err);
+            }
             self.device_name_cache.insert(dev, value);
         }
         self.device_name_cache

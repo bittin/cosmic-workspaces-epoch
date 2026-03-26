@@ -30,7 +30,7 @@ use cosmic::{
         },
     },
 };
-use std::{cell::RefCell, collections::HashMap, sync::Arc, thread};
+use std::{cell::RefCell, collections::HashMap, hash::Hash, sync::Arc, thread};
 
 mod buffer;
 use buffer::Buffer;
@@ -48,7 +48,20 @@ mod workspace;
 use super::{CaptureFilter, CaptureImage, Cmd, Event};
 
 pub fn subscription(conn: Connection) -> iced::Subscription<Event> {
-    iced::Subscription::run_with_id("wayland-sub", async { start(conn) }.flatten_stream())
+    #[derive(Clone)]
+    struct WaylandSubscription(Connection);
+    impl Hash for WaylandSubscription {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.backend().display_id().hash(state);
+        }
+    }
+    iced::Subscription::run_with(
+        WaylandSubscription(conn.clone()),
+        |WaylandSubscription(conn)| {
+            let conn = conn.clone();
+            async { start(conn) }.flatten_stream()
+        },
+    )
 }
 
 pub struct AppData {
@@ -283,6 +296,14 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
         // spawn an executor using one additional thread.
         let thread_pool = ThreadPool::builder().pool_size(1).create().unwrap();
 
+        let vulkan = vulkan::Vulkan::new();
+        if let Err(err) = &vulkan {
+            log::info!(
+                "Unable to initialize Vulkan: {}. Assuming now GPU workarounds needed.",
+                err
+            );
+        }
+
         let registry_state = RegistryState::new(&globals);
         let mut app_data = AppData {
             qh: qh.clone(),
@@ -300,7 +321,7 @@ fn start(conn: Connection) -> mpsc::Receiver<Event> {
             dmabuf_feedback: None,
             gbm_devices: GbmDevices::default(),
             thread_pool,
-            vulkan: vulkan::Vulkan::new(),
+            vulkan: vulkan.ok(),
         };
 
         let (cmd_sender, cmd_channel) = calloop::channel::channel();
