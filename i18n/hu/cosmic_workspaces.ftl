@@ -1,2 +1,2 @@
-workspace = Munkaterület { $number }
+workspace = { $number }. munkaterület
 new-workspace = Új munkaterület
