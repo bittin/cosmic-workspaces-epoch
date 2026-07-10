@@ -409,7 +409,7 @@ impl App {
         // TODO: If compositor supports overlap notify, also use that?
         // Or otherwise verify the panel is actually running.
         for config in self.panel_configs.values().flatten() {
-            if config.autohide.is_some() && !config.exclusive_zone {
+            if config.autohide_enabled() && !config.exclusive_zone {
                 let dimention_constraints = config.get_dimensions(
                     Some((output.width as u32, output.height as u32)),
                     None,
