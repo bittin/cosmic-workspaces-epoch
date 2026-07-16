@@ -11,20 +11,25 @@ use cctk::wayland_client::{Connection, Proxy};
 use cctk::wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1;
 use clap::Parser;
 use cosmic::app::{Application, CosmicFlags};
+use cosmic::cctk::wayland_client::backend::ObjectId;
+use cosmic::core::Auto;
 use cosmic::iced::clipboard::dnd::{DndEvent, SourceEvent};
 use cosmic::iced::event::wayland::{Event as WaylandEvent, LayerEvent, OutputEvent};
 use cosmic::iced::keyboard::key::{Key, Named};
 use cosmic::iced::mouse::ScrollDelta;
-use cosmic::iced::platform_specific::shell::commands::layer_surface::{
-    destroy_layer_surface, get_layer_surface,
-};
+use cosmic::iced::platform_specific::shell::commands::layer_surface::destroy_layer_surface;
+use cosmic::iced::runtime::platform_specific::wayland::CornerRadius;
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
-    IcedOutput, SctkLayerSurfaceSettings,
+    IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
 };
-use cosmic::iced::window::Id as SurfaceId;
-use cosmic::iced::{self, Size, Subscription, Task};
+use cosmic::iced::window::{self, Id as SurfaceId};
+use cosmic::iced::{self, Rectangle, Size, Subscription, Task};
 use cosmic::scroll::DiscreteScrollState;
-use cosmic::{cctk, dbus_activation};
+use cosmic::surface::action::LiveSettings;
+use cosmic::widget::rectangle_tracker::{
+    RectangleTracker, RectangleUpdate, rectangle_tracker_subscription,
+};
+use cosmic::{cctk, dbus_activation, widget};
 use cosmic_comp_config::CosmicCompConfig;
 use cosmic_config::CosmicConfigEntry;
 use cosmic_config::cosmic_config_derive::CosmicConfigEntry;
@@ -114,6 +119,7 @@ enum Msg {
     PanelConfig(CosmicPanelConfig),
     ActionOnTyping(String),
     Ignore,
+    Rectangle(RectangleUpdate<RectId>),
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +156,7 @@ struct Toplevel {
     info: ToplevelInfo,
     img: Option<backend::CaptureImage>,
     icon: Option<PathBuf>,
+    pub pending_move: Option<ExtWorkspaceHandleV1>,
 }
 
 #[derive(Clone)]
@@ -174,6 +181,14 @@ struct Conf {
     bg: cosmic_bg_config::state::State,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RectId {
+    id: window::Id,
+    toplevel_id: Option<ObjectId>,
+    workspaces_id: Option<Vec<ObjectId>>,
+    widget_id: Option<widget::Id>,
+}
+
 #[derive(Default)]
 struct App {
     capture_filter: backend::CaptureFilter,
@@ -194,6 +209,9 @@ struct App {
     dbus_interface: Option<dbus::Interface>,
     panel_configs: HashMap<String, Option<CosmicPanelConfig>>,
     action_on_typing_activated: bool,
+    rectangle_tracker: Option<RectangleTracker<RectId>>,
+    rects: HashMap<RectId, Rectangle>,
+    sub_ctr: u128,
 }
 
 #[derive(Debug, Default)]
@@ -234,16 +252,24 @@ impl App {
                 output: output.clone(),
             },
         );
-        get_layer_surface(SctkLayerSurfaceSettings {
-            id,
-            keyboard_interactivity: KeyboardInteractivity::Exclusive,
-            namespace: "cosmic-workspace-overview".into(),
-            layer: Layer::Top,
-            size: Some((None, None)),
-            output: IcedOutput::Output(output),
-            anchor: Anchor::all(),
-            ..Default::default()
-        })
+        cosmic::surface::surface_task::<Msg>(cosmic::surface::action::simple_layer_shell::<Msg>(
+            || LiveSettings {
+                padding: Some(IcedMargin::default()),
+                corners: Some(CornerRadius::default()),
+                blur: Some(false),
+            },
+            move || SctkLayerSurfaceSettings {
+                id,
+                keyboard_interactivity: KeyboardInteractivity::Exclusive,
+                namespace: "cosmic-workspace-overview".into(),
+                layer: Layer::Top,
+                size: Some((None, None)),
+                output: IcedOutput::Output(output.clone()),
+                anchor: Anchor::all(),
+                ..Default::default()
+            },
+            None::<fn() -> cosmic::Element<'static, cosmic::Action<Msg>>>,
+        ))
     }
 
     fn destroy_surface(&mut self, output: &wl_output::WlOutput) -> Task<cosmic::Action<Msg>> {
@@ -383,7 +409,7 @@ impl App {
         // TODO: If compositor supports overlap notify, also use that?
         // Or otherwise verify the panel is actually running.
         for config in self.panel_configs.values().flatten() {
-            if config.autohide.is_some() && !config.exclusive_zone {
+            if config.autohide_enabled() && !config.exclusive_zone {
                 let dimention_constraints = config.get_dimensions(
                     Some((output.width as u32, output.height as u32)),
                     None,
@@ -421,6 +447,72 @@ impl App {
         }
         regions
     }
+
+    fn update_active_workspace(
+        &mut self,
+        workspace_handle: ObjectId,
+    ) -> Option<Task<cosmic::Action<Msg>>> {
+        if let Some((cur_window, _)) = self.layer_surfaces.iter().find(|(_, layer_surface)| {
+            self.workspaces
+                .for_output(&layer_surface.output)
+                .any(|w| w.handle().id() == workspace_handle)
+        }) {
+            let active = cosmic::theme::active();
+            let rad = active
+                .cosmic()
+                .radius_s()
+                .map(|x| if x < 4.0 { x } else { x + 8.0 });
+
+            let mut rects = Vec::new();
+            let mut strips: Vec<Rectangle> = self
+                .rects
+                .iter()
+                .filter_map(|(id, rect)| {
+                    if self.drag_surface.as_ref().is_some_and(|(s, _)| match s {
+                        DragSurface::Workspace(_) => false,
+                        DragSurface::Toplevel(ext_foreign_toplevel_handle_v1) => id
+                            .toplevel_id
+                            .as_ref()
+                            .is_some_and(|t| *t == ext_foreign_toplevel_handle_v1.id()),
+                    }) || id.id != *cur_window
+                        || id
+                            .workspaces_id
+                            .as_ref()
+                            .is_some_and(|l| !l.iter().any(|o| *o == workspace_handle))
+                    {
+                        return None;
+                    }
+
+                    let rad = if id.toplevel_id.is_none() {
+                        CornerRadius {
+                            top_left: rad[0] as u32,
+                            top_right: rad[1] as u32,
+                            bottom_left: rad[3] as u32,
+                            bottom_right: rad[2] as u32,
+                        }
+                    } else {
+                        rects.push(*rect);
+                        return None;
+                    };
+
+                    Some(cosmic::surface::corner_radius::rounded_rect_strips(
+                        *rect, rad,
+                    ))
+                })
+                .flatten()
+                .collect();
+            strips.append(&mut rects);
+
+            return Some(
+                cosmic::iced::platform_specific::shell::commands::blur::blur(
+                    *cur_window,
+                    Some(strips),
+                )
+                .discard(),
+            );
+        }
+        None
+    }
 }
 
 impl Application for App {
@@ -429,7 +521,9 @@ impl Application for App {
     type Flags = Args;
     const APP_ID: &'static str = "com.system76.CosmicWorkspaces";
 
-    fn init(core: cosmic::app::Core, _flags: Self::Flags) -> (Self, Task<cosmic::Action<Msg>>) {
+    fn init(mut core: cosmic::app::Core, _flags: Self::Flags) -> (Self, Task<cosmic::Action<Msg>>) {
+        core.set_app_type(cosmic::core::AppType::System);
+        core.set_auto_blur(Auto::Popup | Auto::Window);
         (
             Self {
                 core,
@@ -443,6 +537,27 @@ impl Application for App {
 
     fn update(&mut self, message: Msg) -> Task<cosmic::Action<Msg>> {
         match message {
+            Msg::Rectangle(u) => match u {
+                RectangleUpdate::Rectangle(r) => {
+                    self.rects.insert(r.0.clone(), r.1);
+                    if self.visible {
+                        let to_update: Vec<_> = self
+                            .workspaces
+                            .0
+                            .iter()
+                            .filter_map(|w| w.is_active().then(|| w.handle().id()))
+                            .collect();
+                        return Task::batch(
+                            to_update
+                                .into_iter()
+                                .filter_map(|w| self.update_active_workspace(w)),
+                        );
+                    }
+                }
+                RectangleUpdate::Init(tracker) => {
+                    self.rectangle_tracker = Some(tracker);
+                }
+            },
             Msg::SourceFinished => {
                 self.drag_surface = None;
             }
@@ -501,6 +616,8 @@ impl Application for App {
                     if self.layer_surfaces.remove(&id).is_none() {
                         log::error!("removing non-existant layer shell id {}?", id);
                     }
+                    self.sub_ctr += 1;
+                    self.rects.retain(|k, _| k.id != id);
                 }
                 _ => {}
             },
@@ -512,6 +629,7 @@ impl Application for App {
                     backend::Event::Workspaces(mut workspaces) => {
                         workspaces.sort_by(|(_, w1), (_, w2)| w1.coordinates.cmp(&w2.coordinates));
                         let old_workspaces = mem::take(&mut self.workspaces);
+                        let mut new_active = Vec::new();
                         for (outputs, workspace) in workspaces {
                             // XXX efficiency
                             let old_workspace = old_workspaces.for_handle(&workspace.handle);
@@ -520,15 +638,25 @@ impl Application for App {
                             let dnd_source_id = old_workspace
                                 .map_or_else(iced::id::Id::unique, |w| w.dnd_source_id.clone());
 
-                            self.workspaces.0.push(Workspace {
+                            let w = Workspace {
                                 info: workspace,
                                 outputs,
                                 img,
                                 has_cursor,
                                 dnd_source_id,
-                            });
+                            };
+                            if w.is_active() {
+                                new_active.push(w.handle().clone());
+                            }
+                            self.workspaces.0.push(w);
                         }
                         self.update_capture_filter();
+                        if self.visible {
+                            return Task::batch(new_active.into_iter().map(|new| {
+                                self.update_active_workspace(new.id())
+                                    .unwrap_or(Task::none())
+                            }));
+                        }
                     }
                     backend::Event::NewToplevel(handle, info) => {
                         log::debug!("New toplevel: {info:?}");
@@ -543,6 +671,7 @@ impl Application for App {
                             handle,
                             info,
                             img: None,
+                            pending_move: None,
                         });
                         // Close workspaces view if a window spawns while open
                         #[cfg(not(feature = "mock-backend"))]
@@ -552,6 +681,8 @@ impl Application for App {
                         return icon_task;
                     }
                     backend::Event::UpdateToplevel(handle, info) => {
+                        let mut t_w = None;
+                        let mut tasks = Vec::new();
                         if let Some(toplevel) = self.toplevels.for_handle_mut(&handle) {
                             let mut task = Task::none();
                             if toplevel.info.app_id != info.app_id {
@@ -562,9 +693,50 @@ impl Application for App {
                                 )
                                 .map(cosmic::Action::App);
                             }
+                            // XX must clean up rectangles after the window has moved
+                            t_w = Some((handle.id(), info.workspace.clone()));
+
+                            if toplevel
+                                .pending_move
+                                .as_ref()
+                                .is_some_and(|w| info.workspace.contains(&w.id()))
+                            {
+                                toplevel.pending_move = None;
+                            }
                             toplevel.info = info;
-                            return task;
+
+                            tasks.push(task);
                         }
+                        if let Some((t, w)) = t_w {
+                            for w in w {
+                                let old_len = self.rects.len();
+                                self.rects.retain(|id, _| {
+                                    id.toplevel_id.as_ref().is_none_or(|old| *old != t)
+                                        || id
+                                            .workspaces_id
+                                            .as_ref()
+                                            .is_some_and(|old| old.contains(&w.id()))
+                                });
+                                if old_len != self.rects.len() {
+                                    self.sub_ctr += 1;
+                                }
+                            }
+                        }
+                        if self.visible {
+                            let to_update: Vec<_> = self
+                                .workspaces
+                                .0
+                                .iter()
+                                .filter_map(|w| w.is_active().then(|| w.handle().id()))
+                                .collect();
+                            tasks.push(Task::batch(
+                                to_update
+                                    .into_iter()
+                                    .filter_map(|w| self.update_active_workspace(w)),
+                            ));
+                        }
+
+                        return Task::batch(tasks);
                     }
                     backend::Event::CloseToplevel(handle) => {
                         if let Some(idx) = self.toplevels.0.iter().position(|x| x.handle == handle)
@@ -604,7 +776,11 @@ impl Application for App {
                 {
                     return self.hide();
                 }
-                self.send_wayland_cmd(backend::Cmd::ActivateWorkspace(workspace_handle));
+
+                self.send_wayland_cmd(backend::Cmd::ActivateWorkspace(workspace_handle.clone()));
+                if let Some(value) = self.update_active_workspace(workspace_handle.id()) {
+                    return value;
+                }
             }
             Msg::ActivateToplevel(toplevel_handle) => {
                 self.send_wayland_cmd(backend::Cmd::ActivateToplevel(toplevel_handle));
@@ -623,13 +799,38 @@ impl Application for App {
                     }
                 }
                 */
+                if self.visible {
+                    let to_update: Vec<_> = self
+                        .workspaces
+                        .0
+                        .iter()
+                        .filter_map(|w| w.is_active().then(|| w.handle().id()))
+                        .collect();
+                    return Task::batch(
+                        to_update
+                            .into_iter()
+                            .filter_map(|w| self.update_active_workspace(w)),
+                    );
+                }
             }
             Msg::CloseToplevel(toplevel_handle) => {
                 // TODO confirmation?
                 self.send_wayland_cmd(backend::Cmd::CloseToplevel(toplevel_handle));
             }
             Msg::StartDrag(drag_surface) => {
+                // if let DragSurface::Toplevel(t) = &drag_surface {}
                 self.drag_surface = Some((drag_surface, Default::default()));
+                let to_update: Vec<_> = self
+                    .workspaces
+                    .0
+                    .iter()
+                    .filter_map(|w| w.is_active().then(|| w.handle().id()))
+                    .collect();
+                return Task::batch(
+                    to_update
+                        .into_iter()
+                        .filter_map(|w| self.update_active_workspace(w)),
+                );
             }
             Msg::DndEnter(drop_target, _x, _y, _mimes) => {
                 self.drop_target = Some(drop_target);
@@ -640,6 +841,21 @@ impl Application for App {
                 if self.drop_target == Some(drop_target) {
                     self.drop_target = None;
                 }
+                self.sub_ctr += 1;
+
+                if self.visible {
+                    let to_update: Vec<_> = self
+                        .workspaces
+                        .0
+                        .iter()
+                        .filter_map(|w| w.is_active().then(|| w.handle().id()))
+                        .collect();
+                    return Task::batch(
+                        to_update
+                            .into_iter()
+                            .filter_map(|w| self.update_active_workspace(w)),
+                    );
+                }
             }
             Msg::DndToplevelDrop(_toplevel) => {
                 if let Some((DragSurface::Toplevel(handle), _)) = &self.drag_surface {
@@ -648,11 +864,34 @@ impl Application for App {
                             DropTarget::WorkspaceSidebarEntry(workspace, output)
                             | DropTarget::OutputToplevels(workspace, output),
                         ) => {
+                            if let Some(t) = self.toplevels.for_handle_mut(handle)
+                                && !t.info.workspace.contains(&workspace.id())
+                            {
+                                self.rects.retain(|r, _| {
+                                    r.toplevel_id.as_ref().is_none_or(|o| *o != handle.id())
+                                });
+                                self.sub_ctr += 1;
+
+                                t.pending_move = Some(workspace.clone());
+                            }
                             self.send_wayland_cmd(backend::Cmd::MoveToplevelToWorkspace(
                                 handle.clone(),
                                 workspace,
                                 output,
                             ));
+                            self.drag_surface = None;
+
+                            let to_update: Vec<_> = self
+                                .workspaces
+                                .0
+                                .iter()
+                                .filter_map(|w| w.is_active().then(|| w.handle().id()))
+                                .collect();
+                            return Task::batch(
+                                to_update
+                                    .into_iter()
+                                    .filter_map(|w| self.update_active_workspace(w)),
+                            );
                         }
                         Some(
                             DropTarget::WorkspacesBar(_)
@@ -879,6 +1118,7 @@ impl Application for App {
             config_subscription,
             comp_config_subscription,
             bg_subscription,
+            rectangle_tracker_subscription(self.sub_ctr).map(|update| Msg::Rectangle(update.1)),
         ];
         if let Some(conn) = self.conn.clone() {
             subscriptions.push(backend::subscription(conn).map(Msg::Wayland));
@@ -895,8 +1135,12 @@ impl Application for App {
     }
 
     fn view_window(&self, id: iced::window::Id) -> cosmic::Element<'_, Self::Message> {
-        if let Some(surface) = self.layer_surfaces.get(&id) {
-            return view::layer_surface(self, surface);
+        if let Some((surface, rectangle_track)) = self
+            .layer_surfaces
+            .get(&id)
+            .zip(self.rectangle_tracker.as_ref())
+        {
+            return view::layer_surface(self, surface, id, rectangle_track);
         }
         log::error!("non-existant layer shell id {}?", id);
         cosmic::widget::text("workspaces").into()

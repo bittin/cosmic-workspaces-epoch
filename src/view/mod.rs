@@ -1,22 +1,23 @@
-use cosmic::Apply;
 use cosmic::cctk::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1;
 use cosmic::cctk::cosmic_protocols::workspace::v2::client::zcosmic_workspace_handle_v2;
+use cosmic::cctk::wayland_client::Proxy;
 use cosmic::cctk::wayland_client::protocol::wl_output;
 use cosmic::cctk::wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1;
 use cosmic::iced::advanced::layout::flex::Axis;
 use cosmic::iced::clipboard::mime::{AllowedMimeTypes, AsMimeTypes};
-use cosmic::iced::core::Shadow;
 use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
+use cosmic::iced::core::{Shadow, window};
 use cosmic::iced::platform_specific::shell::subsurface_widget::Subsurface;
 use cosmic::iced::widget::{column, row};
 use cosmic::iced::{self, Alignment, Border, Length};
-use cosmic::widget::{self, Widget};
+use cosmic::widget::{self, Widget, rectangle_tracker};
+use cosmic::{Apply, Element};
 use cosmic_comp_config::workspace::WorkspaceLayout;
 use std::collections::HashSet;
 
 use crate::backend::{self, CaptureImage};
 use crate::dnd::{Drag, DragSurface, DragToplevel, DragWorkspace, DropTarget};
-use crate::{App, LayerSurface, Msg, Toplevel, Workspace};
+use crate::{App, LayerSurface, Msg, RectId, Toplevel, Workspace};
 
 fn dnd_source_with_drag_surface<D: AsMimeTypes + Send + Clone + 'static>(
     drag_content: D,
@@ -69,6 +70,8 @@ where
 pub(crate) fn layer_surface<'a>(
     app: &'a App,
     surface: &'a LayerSurface,
+    window_id: window::Id,
+    rectangle_track: &rectangle_tracker::RectangleTracker<RectId>,
 ) -> cosmic::Element<'a, Msg> {
     let mut drag_toplevel = None;
     let mut drag_workspace = None;
@@ -89,6 +92,7 @@ pub(crate) fn layer_surface<'a>(
         .flat_map(|t| &t.info.workspace)
         .collect::<HashSet<_>>();
     let layout = app.conf.workspace_config.workspace_layout;
+    // track this rectangle
     let sidebar = workspaces_sidebar(
         app.workspaces.for_output(&surface.output),
         &workspaces_with_toplevels,
@@ -96,6 +100,8 @@ pub(crate) fn layer_surface<'a>(
         layout,
         app.drop_target.as_ref(),
         drag_workspace,
+        window_id,
+        rectangle_track,
     );
     let toplevels = toplevel_previews(
         app.toplevels.0.iter().filter(|i| {
@@ -111,6 +117,8 @@ pub(crate) fn layer_surface<'a>(
         }),
         layout,
         drag_toplevel,
+        window_id,
+        rectangle_track,
     );
     // TODO multiple active workspaces? Not currently supported by cosmic.
     let first_active_workspace = app
@@ -146,6 +154,7 @@ pub(crate) fn layer_surface<'a>(
     let container = widget::container(container).padding(panel_regions);
 
     let output = surface.output.clone();
+
     widget::mouse_area(container)
         .on_scroll(move |delta| Msg::OnScroll(output.clone(), delta))
         .into()
@@ -162,12 +171,12 @@ fn pin_button_style(theme: &cosmic::Theme, is_pinned: bool) -> cosmic::widget::b
     let bg_color = if is_pinned {
         theme.cosmic().accent.base.into()
     } else {
-        theme.cosmic().primary.base.into()
+        theme.cosmic().primary(theme.transparent).base.into()
     };
     let icon_color = if is_pinned {
         theme.cosmic().accent.on.into()
     } else {
-        theme.cosmic().primary.on.into()
+        theme.cosmic().primary(theme.transparent).on.into()
     };
     cosmic::widget::button::Style {
         icon_color: Some(icon_color),
@@ -322,6 +331,7 @@ fn workspace_item(
     {
         button = button.on_press(Msg::ActivateWorkspace(workspace.handle().clone()));
     }
+
     button.into()
 }
 
@@ -420,6 +430,8 @@ fn workspaces_sidebar<'a>(
     layout: WorkspaceLayout,
     drop_target: Option<&DropTarget>,
     drag_workspace: Option<&'a backend::ExtWorkspaceHandleV1>,
+    window_id: window::Id,
+    rectangle_track: &rectangle_tracker::RectangleTracker<RectId>,
 ) -> cosmic::Element<'a, Msg> {
     let mut sidebar_entries = Vec::new();
     for workspace in workspaces {
@@ -480,32 +492,48 @@ fn workspaces_sidebar<'a>(
         widget::container(crate::widgets::workspace_bar(sidebar_entries, axis)).padding(8.0);
 
     widget::container(
-        widget::container(sidebar_entries_container)
-            .width(width)
-            .height(height)
-            .class(cosmic::theme::Container::custom(|theme| {
-                cosmic::iced::widget::container::Style {
-                    text_color: Some(theme.cosmic().on_bg_color().into()),
-                    icon_color: Some(theme.cosmic().on_bg_color().into()),
-                    background: Some(iced::Color::from(theme.cosmic().background.base).into()),
-                    border: Border {
-                        radius: theme
-                            .cosmic()
-                            .radius_s()
-                            .map(|x| if x < 4.0 { x } else { x + 8.0 })
-                            .into(),
-                        ..Default::default()
-                    },
-                    shadow: Shadow::default(),
-                    snap: true,
-                }
-            })),
+        rectangle_track.container(
+            RectId {
+                id: window_id,
+                toplevel_id: None,
+                widget_id: None,
+                workspaces_id: None,
+            },
+            widget::container(sidebar_entries_container)
+                .width(width)
+                .height(height)
+                .class(cosmic::theme::Container::custom(|theme| {
+                    cosmic::iced::widget::container::Style {
+                        text_color: Some(theme.cosmic().on_bg_color().into()),
+                        icon_color: Some(theme.cosmic().on_bg_color().into()),
+                        background: Some(
+                            iced::Color::from(theme.cosmic().background(theme.transparent).base)
+                                .into(),
+                        ),
+                        border: Border {
+                            radius: theme
+                                .cosmic()
+                                .radius_s()
+                                .map(|x| if x < 4.0 { x } else { x + 8.0 })
+                                .into(),
+                            ..Default::default()
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    }
+                })),
+        ),
     )
     .padding(8)
     .into()
 }
 
-fn toplevel_preview(toplevel: &Toplevel, is_being_dragged: bool) -> cosmic::Element<'static, Msg> {
+fn toplevel_preview(
+    toplevel: &Toplevel,
+    is_being_dragged: bool,
+    window_id: window::Id,
+    rectangle_track: &rectangle_tracker::RectangleTracker<RectId>,
+) -> cosmic::Element<'static, Msg> {
     let cosmic::cosmic_theme::Spacing {
         space_xxs, space_s, ..
     } = cosmic::theme::active().cosmic().spacing;
@@ -524,6 +552,8 @@ fn toplevel_preview(toplevel: &Toplevel, is_being_dragged: bool) -> cosmic::Elem
     .align_y(Alignment::Center);
 
     let title = row![
+        // TODO tracker for each of these buttons?
+        // So that they can be blurred individually like the sidebar?
         widget::button::custom(label)
             .on_press(Msg::ActivateToplevel(toplevel.handle.clone()))
             .class(cosmic::theme::Button::Icon)
@@ -532,7 +562,7 @@ fn toplevel_preview(toplevel: &Toplevel, is_being_dragged: bool) -> cosmic::Elem
             .class(cosmic::theme::Container::custom(|theme| {
                 cosmic::iced::widget::container::Style {
                     background: Some(
-                        iced::Color::from(theme.cosmic().background.component.base).into(),
+                        iced::Color::from(theme.cosmic().background(false).component.base).into(),
                     ),
                     border: Border {
                         color: theme.cosmic().bg_divider().into(),
@@ -549,17 +579,30 @@ fn toplevel_preview(toplevel: &Toplevel, is_being_dragged: bool) -> cosmic::Elem
     .spacing(8)
     .padding([0, 0, 2, 0])
     .align_y(Alignment::Center);
-
     let alpha = if is_being_dragged { 0.5 } else { 1.0 };
-    let preview = widget::button::custom(capture_image(toplevel.img.as_ref(), alpha))
-        .selected(
-            toplevel
-                .info
-                .state
-                .contains(&zcosmic_toplevel_handle_v1::State::Activated),
-        )
-        .class(cosmic::theme::Button::Image)
-        .on_press(Msg::ActivateToplevel(toplevel.handle.clone()));
+    let content = capture_image(toplevel.img.as_ref(), alpha);
+
+    let preview = widget::button::custom(if toplevel.pending_move.is_some() || is_being_dragged {
+        Element::from(content)
+    } else {
+        Element::from(rectangle_track.container(
+            RectId {
+                id: window_id,
+                toplevel_id: Some(toplevel.handle.id()),
+                widget_id: None,
+                workspaces_id: Some(toplevel.info.workspace.iter().map(|h| h.id()).collect()),
+            },
+            content,
+        ))
+    })
+    .selected(
+        toplevel
+            .info
+            .state
+            .contains(&zcosmic_toplevel_handle_v1::State::Activated),
+    )
+    .class(cosmic::theme::Button::Image)
+    .on_press(Msg::ActivateToplevel(toplevel.handle.clone()));
 
     widget::mouse_area(crate::widgets::size_cross_nth(
         vec![title.into(), preview.into()],
@@ -570,23 +613,26 @@ fn toplevel_preview(toplevel: &Toplevel, is_being_dragged: bool) -> cosmic::Elem
     .into()
 }
 
-fn toplevel_previews_entry(
-    toplevel: &Toplevel,
+fn toplevel_previews_entry<'a>(
+    toplevel: &'a Toplevel,
     is_being_dragged: bool,
-) -> cosmic::Element<'_, Msg> {
+    window_id: window::Id,
+    rectangle_track: &rectangle_tracker::RectangleTracker<RectId>,
+) -> cosmic::Element<'a, Msg> {
     // Dragged window still takes up space until moved, but isn't rendered while drag surface is
     // shown.
     let preview = crate::widgets::visibility_wrapper(
-        toplevel_preview(toplevel, is_being_dragged),
+        toplevel_preview(toplevel, is_being_dragged, window_id, rectangle_track),
         !is_being_dragged,
     );
     let toplevel2 = toplevel.clone();
+    let track = rectangle_track.clone();
     dnd_source_with_drag_surface(
         DragToplevel {},
         DragSurface::Toplevel(toplevel.handle.clone()),
         None,
         preview.into(),
-        move || toplevel_preview(&toplevel2, true),
+        move || toplevel_preview(&toplevel2, true, window_id, &track),
     )
 }
 
@@ -594,13 +640,22 @@ fn toplevel_previews<'a>(
     toplevels: impl Iterator<Item = &'a Toplevel>,
     layout: WorkspaceLayout,
     drag_toplevel: Option<&'a backend::ExtForeignToplevelHandleV1>,
+    window_id: window::Id,
+    rectangle_track: &rectangle_tracker::RectangleTracker<RectId>,
 ) -> cosmic::Element<'a, Msg> {
     let (width, height) = match layout {
         WorkspaceLayout::Vertical => (Length::FillPortion(4), Length::Fill),
         WorkspaceLayout::Horizontal => (Length::Fill, Length::FillPortion(4)),
     };
     let entries = toplevels
-        .map(|t| toplevel_previews_entry(t, drag_toplevel == Some(&t.handle)))
+        .map(|t| {
+            toplevel_previews_entry(
+                t,
+                drag_toplevel == Some(&t.handle),
+                window_id,
+                rectangle_track,
+            )
+        })
         .collect();
     //row(entries)
     widget::mouse_area(
